@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
-"""TPS 统计服务：读 model_usage 按轮折叠，供 ZCode 渲染层注入脚本取数。
+"""TPS 统计服务：读 turn_usage/model_usage 按轮折叠，供 ZCode 渲染层注入脚本取数。
 
-口径与 ~/.zcode/hooks/tps_footer.py 完全一致（1:1 对齐 DeepSeek Harness）：
-  - 整轮墙钟 run_ms = MAX(completed_at) - MIN(started_at)（含工具时段）
-  - 首 token = 本轮最早发起那一步的 time_to_first_token_ms
-  - tok/s    = Σoutput_tokens ÷ Σ(duration_ms - ttft)（只计两值齐备的步）
+口径（对齐 DeepSeek harness；聚合键 = (session_id, turn_id)，数据库主键同此）：
+  - 只返回已结束回合（turn_usage.completed_at 非空）
+  - 整轮墙钟 run_ms = turn_usage.completed_at − started_at（含工具执行时段）
+  - 首 token = turn_usage.time_to_first_token_ms，是整轮首 token 延迟
+    （first_token_at − started_at，从提问到第一个 token，非首次模型调用的 TTFT）
+  - tok/s = Σ样本token ÷ Σ样本解码时间；样本 = completed 且 main_turn、
+    0 ≤ ttft < duration 的调用，解码时间 = duration − ttft（扣除该次首 token 等待）
+  - series/peak_tps = 每步（单次调用）平均速度 / 单步最高均速（非瞬时采样）
 
 端点：
   GET /healthz            → "ok"
-  GET /turns?limit=500    → {"turns":[{turn_id,session_id,start_ms,end_ms,run_ms,ttft_ms,tps,out_tokens,models}]}（按 end_ms 降序）
+  GET /turns?limit=500    → {"turns":[{turn_id,session_id,status,start_ms,end_ms,run_ms,ttft_ms,tps,
+                             peak_tps,series,decode_ms,measured_tokens,out_tokens,models}]}
+                             （仅已结束回合，按 end_ms 降序；measured_tokens 与 decode_ms 为同一
+                             测速样本的 token 数/解码时长，series/peak_tps 为每步均速/单步最高均速）
 
 常驻：launchd LaunchAgent（com.zcode-tps-footer.server），127.0.0.1:3117，仅本机。
 """
@@ -30,8 +37,13 @@ _cache: dict = {"at": 0.0, "turns": []}
 
 
 def fold_turns() -> list[dict]:
-    """主查询走 turn_usage（CLI 权威按轮聚合，含 user_message_id 桥）；
-    tok/s 仍从 model_usage 折叠解码时间（口径=DeepSeek：Σtokens÷Σ(duration−ttft)）。"""
+    """主查询走 turn_usage（CLI 权威按轮聚合，含 user_message_id 桥），只返回已结束回合
+    （completed_at 非空）——进行中的回合数据不全，画出来也不会再刷新，索性不出。
+    速度口径（与 DeepSeek harness 对齐）：
+      - 测速样本 = completed 且 main_turn、TTFT 与 duration 齐备、duration−TTFT>0 的单次调用；
+        分子分母只从样本累计，token 绝不会计入时间缺失的调用（避免均值虚高超过峰值）
+      - tok/s = Σ样本token ÷ Σ样本解码时间；measured_tokens/decode_ms 即这对样本值
+      - series/peak_tps = 每步（单次调用）平均速度，峰值为单步最高均速，非瞬时采样"""
     cut = int(time.time() * 1000) - 24 * 60 * 60 * 1000
     conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
     try:
@@ -41,43 +53,52 @@ def fold_turns() -> list[dict]:
                    started_at, completed_at, time_to_first_token_ms, output_tokens
             FROM turn_usage
             WHERE started_at >= ? AND user_message_id IS NOT NULL AND user_message_id != ''
+              AND completed_at IS NOT NULL
             ORDER BY started_at ASC
             """,
             (cut,),
         ).fetchall()
-        # 解码时间按 turn 从 model_usage 折叠 + 收集每轮用过的模型
+        # 逐行扫 model_usage：折叠解码时间 + 收集每步 tok/s 序列与用过的模型
+        # 聚合键必须是 (session_id, turn_id) 复合键——跨会话 turn_id 撞车时按 tid 聚会混算
         dec = {}
+        series = {}
+        raw_peak = {}  # 未取整的单步最高均速（series 为紧凑展示只留 1 位小数，取峰值不能用它）
         models_by_turn = {}
-        for r in conn.execute(
+        for sid, tid, model_id, dur, ttft, tok in conn.execute(
             """
-            SELECT turn_id, model_id,
-                   SUM(CASE WHEN time_to_first_token_ms IS NOT NULL
-                             AND duration_ms - time_to_first_token_ms > 0
-                             AND output_tokens > 0
-                        THEN duration_ms - time_to_first_token_ms ELSE 0 END),
-                   SUM(CASE WHEN time_to_first_token_ms IS NOT NULL AND output_tokens > 0
-                        THEN output_tokens ELSE 0 END)
+            SELECT session_id, turn_id, model_id, duration_ms, time_to_first_token_ms, output_tokens
             FROM model_usage
             WHERE status = 'completed' AND query_source = 'main_turn'
               AND started_at >= ?
-            GROUP BY turn_id, model_id
+            ORDER BY started_at ASC
             """,
             (cut,),
         ):
-            d, tok = dec.get(r[0], (0, 0))
-            dec[r[0]] = (d + (r[2] or 0), tok + (r[3] or 0))
-            if r[1]:
-                models_by_turn.setdefault(r[0], [])
-                if r[1] not in models_by_turn[r[0]]:
-                    models_by_turn[r[0]].append(r[1])
+            key = (sid, tid)
+            d, t = dec.get(key, (0, 0))
+            # 分子分母同步累计；样本合法性显式校验：时间齐备且 0 <= ttft < dur
+            # （dur 缺失时不允许靠 or 0 拼出正的解码时间，负 TTFT 一律排除）
+            if dur is not None and ttft is not None and 0 <= ttft < dur and tok and tok > 0:
+                step_ms = dur - ttft
+                d += step_ms
+                t += tok
+                rate = tok * 1000.0 / step_ms
+                series.setdefault(key, []).append(round(rate, 1))
+                raw_peak[key] = max(raw_peak.get(key, 0.0), rate)
+            dec[key] = (d, t)
+            if model_id:
+                models_by_turn.setdefault(key, [])
+                if model_id not in models_by_turn[key]:
+                    models_by_turn[key].append(model_id)
     finally:
         conn.close()
 
     out = []
     for sid, tid, msg_id, status, started, completed, ttft, out_tok in turns:
-        completed = completed or started
-        decode_ms, decode_tok = dec.get(tid, (0, 0))
+        key = (sid, tid)
+        decode_ms, decode_tok = dec.get(key, (0, 0))
         tps = (decode_tok * 1000.0 / decode_ms) if decode_ms > 0 else None
+        steps = series.get(key, [])
         out.append(
             {
                 "turn_id": tid,
@@ -89,8 +110,12 @@ def fold_turns() -> list[dict]:
                 "run_ms": max(0, completed - started),
                 "ttft_ms": ttft,
                 "tps": round(tps, 2) if tps else None,
-                "out_tokens": out_tok or 0,
-                "models": models_by_turn.get(tid, []),
+                "peak_tps": round(raw_peak[key], 2) if key in raw_peak else None,
+                "series": steps,
+                "decode_ms": decode_ms,
+                "measured_tokens": decode_tok,  # 参与测速的 token 数（与 decode_ms 同样本）
+                "out_tokens": out_tok or 0,     # 整轮总输出（可能与测速样本不同）
+                "models": models_by_turn.get(key, []),
             }
         )
     out.sort(key=lambda t: t["end_ms"], reverse=True)
